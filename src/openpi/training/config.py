@@ -13,6 +13,7 @@ import flax.nnx as nnx
 from typing_extensions import override
 import tyro
 
+import openpi.models.lamda_config as lamda_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -164,6 +165,42 @@ class ModelTransformFactory(GroupFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LaMDAModelTransformFactory(GroupFactory):
+    """Creates model transforms for LaMDA-based models (518×518 images, LaMDA tokenizer)."""
+
+    default_prompt: str | None = None
+
+    def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        match model_config.model_type:
+            case _model.ModelType.PI0:
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(518, 518),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.LaMDATokenizer(model_config.max_token_len),
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _model.ModelType.PI05:
+                assert isinstance(model_config, lamda_config.LaMDAConfig)
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(518, 518),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.LaMDATokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _:
+                raise ValueError(f"LaMDAModelTransformFactory does not support model type: {model_config.model_type}")
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
@@ -253,6 +290,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     )
     # Action keys that will be used to read the action sequence from the dataset.
     action_sequence_keys: Sequence[str] = ("action",)
+    # Override for model transform factory (e.g. LaMDAModelTransformFactory).
+    model_transforms: tyro.conf.Suppress[GroupFactory | None] = None
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -267,7 +306,8 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
 
-        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        transform_factory = self.model_transforms or ModelTransformFactory(default_prompt=self.default_prompt)
+        model_transforms = transform_factory(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -343,8 +383,10 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             )
 
         # Model transforms include things like tokenizing the prompt and action targets
-        # You do not need to change anything here for your own dataset.
-        model_transforms = ModelTransformFactory()(model_config)
+        if isinstance(model_config, lamda_config.LaMDAConfig):
+            model_transforms = LaMDAModelTransformFactory()(model_config)
+        else:
+            model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
         return dataclasses.replace(
@@ -929,6 +971,72 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # LaMDA-based configs.
+    #
+    TrainConfig(
+        name="lamda_aloha_sim",
+        model=lamda_config.LaMDAConfig(),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+            model_transforms=LaMDAModelTransformFactory(default_prompt="Transfer cube"),
+        ),
+        weight_loader=weight_loaders.LaMDAWeightLoader("/data/models/biyuz/hf_home/models/LaMDA-full"),
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="lamda_libero",
+        model=lamda_config.LaMDAConfig(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.LaMDAWeightLoader("/data/models/biyuz/hf_home/models/LaMDA-full"),
+        num_train_steps=30_000,
+    ),
+    # 极速过拟合 / 小规模验证：本地 LIBERO LeRobot 数据，LaMDA + Action Expert
+    # 使用前请设置 HF_LEROBOT_HOME（见 run_train.sh），使 repo_id 指向本地目录
+    # TODO: 若使用 libero_10 等子集，将 repo_id 改为子集目录名（如 "libero_10"），并确保 HF_LEROBOT_HOME 为父路径
+    TrainConfig(
+        name="train_lamda_libero",
+        model=lamda_config.LaMDAConfig(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        weight_loader=weight_loaders.LaMDAWeightLoader("/data/models/biyuz/hf_home/models/LaMDA-full"),
+        batch_size=4,
+        num_train_steps=500,
+        save_interval=100,
+        log_interval=10,
+        num_workers=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=5e-5,
+            decay_steps=500,
+            decay_lr=1e-5,
+        ),
+        pytorch_training_precision="bfloat16",
+        overwrite=False,
+        exp_name="lamda_libero_overfit",
+        wandb_enabled=True,
+    ),
+    TrainConfig(
+        name="debug_lamda",
+        model=lamda_config.LaMDAConfig(
+            action_expert_variant="dummy",
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_lamda",
+        wandb_enabled=False,
     ),
     #
     # Debugging configs.

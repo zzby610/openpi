@@ -40,11 +40,14 @@ import torch.nn.parallel
 import tqdm
 import wandb
 
+import openpi.models.lamda_config
 import openpi.models.pi0_config
+import openpi.models_pytorch.pi0_lamda_pytorch
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.weight_loaders
 
 
 def init_logging():
@@ -390,8 +393,15 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
+    if isinstance(config.model, openpi.models.lamda_config.LaMDAConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model = openpi.models_pytorch.pi0_lamda_pytorch.PI0LamdaPytorch(model_cfg).to(device)
+    elif isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    else:
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
             action_dim=config.model.action_dim,
@@ -401,12 +411,7 @@ def train_loop(config: _config.TrainConfig):
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
         )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
-
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -438,8 +443,14 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
+    # Load LaMDA pretrained weights (und-branch only, gen-branch filtered)
+    if isinstance(config.weight_loader, openpi.training.weight_loaders.LaMDAWeightLoader):
+        logging.info(f"Loading LaMDA und-branch weights from: {config.weight_loader.checkpoint_path}")
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        config.weight_loader.load_pytorch(model_to_load)
+        logging.info("LaMDA weight loading complete.")
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
+    elif config.pytorch_weight_path is not None:
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")

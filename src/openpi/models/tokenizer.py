@@ -5,10 +5,13 @@ import jax
 import numpy as np
 import orbax.checkpoint as ocp
 import sentencepiece
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoTokenizer
 
 import openpi.models.utils.fsq_tokenizer as fsq_tokenizer
 import openpi.shared.download as download
+
+LAMDA_TOKENIZER_PATH = "/data/models/biyuz/hf_home/models/LLaDA-8B-Base"
+_LAMDA_SPECIAL_TOKENS = ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>"]
 
 
 class PaligemmaTokenizer:
@@ -43,6 +46,57 @@ class PaligemmaTokenizer:
                     "Consider increasing the `max_token_len` in your model config if this happens frequently."
                 )
             tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+
+class LaMDATokenizer:
+    """Tokenizer for the LaMDA/LLaDA-8B backbone.
+
+    Uses ``AutoTokenizer`` from the local LLaDA-8B checkpoint instead of the
+    PaliGemma SentencePiece model.  Ensures special vision/chat tokens are
+    present in the vocabulary.
+    """
+
+    def __init__(self, max_len: int = 48, tokenizer_path: str = LAMDA_TOKENIZER_PATH):
+        self._max_len = max_len
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+        existing = set(self._tokenizer.all_special_tokens)
+        new_tokens = [t for t in _LAMDA_SPECIAL_TOKENS if t not in existing]
+        if new_tokens:
+            self._tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+            logging.info("LaMDATokenizer: added special tokens %s", new_tokens)
+
+    @property
+    def hf_tokenizer(self):
+        """Expose the underlying HuggingFace tokenizer for external use."""
+        return self._tokenizer
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is not None:
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+        else:
+            full_prompt = cleaned_text + "\n"
+
+        encoded = self._tokenizer.encode(full_prompt, add_special_tokens=True)
+        tokens_len = len(encoded)
+
+        if tokens_len < self._max_len:
+            padding = [0] * (self._max_len - tokens_len)
+            mask = [True] * tokens_len + [False] * (self._max_len - tokens_len)
+            tokens = encoded + padding
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config."
+                )
+            tokens = encoded[: self._max_len]
             mask = [True] * self._max_len
 
         return np.asarray(tokens), np.asarray(mask)
