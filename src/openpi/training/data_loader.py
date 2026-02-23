@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import lerobot.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+import pandas as pd
 import torch
 
 import openpi.models.model as _model
@@ -146,7 +147,17 @@ def create_torch_dataset(
     )
 
     if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        # LeRobot meta.tasks is a pd.DataFrame (index=task strings, column task_index); convert to dict[int, str]
+        # so PromptFromLeRobotTask can look up by task_index (multi-task datasets).
+        tasks_meta = dataset_meta.tasks
+        if isinstance(tasks_meta, pd.DataFrame):
+            # Row label (index) is the task string; column "task_index" is the int key (matches LeRobot __getitem__).
+            tasks_dict = {
+                int(row["task_index"]): idx for idx, row in tasks_meta.iterrows()
+            }
+        else:
+            tasks_dict = tasks_meta
+        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(tasks_dict)])
 
     return dataset
 

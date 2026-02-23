@@ -90,7 +90,7 @@ class RepackTransform(DataTransformFn):
             "cam_low": "observation.images.bottom",
         },
         "state": "observation.state",
-        "actions": "action",
+        "action": "action",
     }
     """
 
@@ -196,7 +196,7 @@ class SubsampleActions(DataTransformFn):
     stride: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["actions"] = data["actions"][:: self.stride]
+        data["action"] = data["action"][:: self.stride]
         return data
 
 
@@ -210,14 +210,14 @@ class DeltaActions(DataTransformFn):
     mask: Sequence[bool] | None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if "action" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state, actions = data["state"], data["action"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+        data["action"] = actions
 
         return data
 
@@ -232,14 +232,14 @@ class AbsoluteActions(DataTransformFn):
     mask: Sequence[bool] | None
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data or self.mask is None:
+        if "action" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state, actions = data["state"], data["action"]
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-        data["actions"] = actions
+        data["action"] = actions
 
         return data
 
@@ -277,7 +277,7 @@ class TokenizeFASTInputs(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        state, actions = data["state"], data.get("actions")
+        state, actions = data["state"], data.get("action")
         tokens, token_mask, ar_mask, loss_mask = self.tokenizer.tokenize(prompt, state, actions)
         return {
             **data,
@@ -295,14 +295,14 @@ class ExtractFASTActions(DataTransformFn):
     action_dim: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        if "actions" not in data:
+        if "action" not in data:
             return data
-        # Model outputs are saved in "actions", but for FAST models they represent tokens.
-        tokens = data.pop("actions")
+        # Model outputs are saved in "action", but for FAST models they represent tokens.
+        tokens = data.pop("action")
         actions = self.tokenizer.extract_actions(tokens.astype(np.int32), self.action_horizon, self.action_dim)
         return {
             **data,
-            "actions": actions,
+            "action": actions,
         }
 
 
@@ -332,8 +332,8 @@ class PadStatesAndActions(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
-        if "actions" in data:
-            data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if "action" in data:
+            data["action"] = pad_to_dim(data["action"], self.model_action_dim, axis=-1)
         return data
 
 

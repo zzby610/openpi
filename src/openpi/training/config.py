@@ -86,7 +86,7 @@ class DataConfig:
     # Names of keys that will be used by the data loader to generate the action sequence. The length of the
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
-    action_sequence_keys: Sequence[str] = ("actions",)
+    action_sequence_keys: Sequence[str] = ("action",)
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -282,7 +282,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
                     {
                         "images": {"cam_high": "observation.images.top"},
                         "state": "observation.state",
-                        "actions": "action",
+                        "action": "action",
                     }
                 )
             ]
@@ -327,25 +327,25 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    # Keys in the LeRobot/HF dataset (source). Pipeline always expects observation/image, observation/state, actions.
+    # Use these when your dataset uses different names (e.g. "observation.images.image", "observation.state", "action").
+    image_key_in_dataset: str = "observation/image"
+    wrist_image_key_in_dataset: str = "observation/wrist_image"
+    state_key_in_dataset: str = "observation/state"
+    # Action column name in dataset; repacked to "actions" and used as action_sequence_keys for the loader.
+    action_key_in_dataset: str = "actions"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        # The repack transform is *only* applied to the data coming from the dataset,
-        # and *not* during inference. We can use it to make inputs from the dataset look
-        # as close as possible to those coming from the inference environment (e.g. match the keys).
-        # Below, we match the keys in the dataset (which we defined in the data conversion script) to
-        # the keys we use in our inference pipeline (defined in the inference script for libero).
-        # For your own dataset, first figure out what keys your environment passes to the policy server
-        # and then modify the mappings below so your dataset's keys get matched to those target keys.
-        # The repack transform simply remaps key names here.
+        # Repack: output key (pipeline) <- source key (dataset). LiberoInputs expects observation/image, observation/state, etc.
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
+                        "observation/image": self.image_key_in_dataset,
+                        "observation/wrist_image": self.wrist_image_key_in_dataset,
+                        "observation/state": self.state_key_in_dataset,
+                        "actions": self.action_key_in_dataset,
                         "prompt": "prompt",
                     }
                 )
@@ -388,12 +388,14 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         else:
             model_transforms = ModelTransformFactory()(model_config)
 
-        # We return all data transforms for training and inference. No need to change anything here.
+        # We return all data transforms for training and inference. action_sequence_keys must match the
+        # dataset column name so the loader asks LeRobot for the correct key (e.g. "action" or "action").
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=(self.action_key_in_dataset,),
         )
 
 
@@ -430,7 +432,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
                         "observation/wrist_image_left": "observation/wrist_image",
                         "observation/joint_position": "observation/joint_position",
                         "observation/gripper_position": "observation/gripper_position",
-                        "actions": "actions",
+                        "action": "action",
                         "prompt": "prompt",
                     }
                 )
@@ -483,7 +485,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
                         "observation/wrist_image_left": "wrist_image_left",
                         "observation/joint_position": "joint_position",
                         "observation/gripper_position": "gripper_position",
-                        "actions": "actions",
+                        "action": "action",
                         "prompt": "prompt",
                     }
                 )
@@ -828,7 +830,7 @@ _CONFIGS = [
                                 "cam_right_wrist": "observation.images.cam_right_wrist",
                             },
                             "state": "observation.state",
-                            "actions": "action",
+                            "action": "action",
                         }
                     )
                 ]
@@ -857,7 +859,7 @@ _CONFIGS = [
                                 "cam_right_wrist": "observation.images.cam_right_wrist",
                             },
                             "state": "observation.state",
-                            "actions": "action",
+                            "action": "action",
                         }
                     )
                 ]
@@ -1008,6 +1010,10 @@ _CONFIGS = [
             repo_id="libero_lerobot",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=True,
+            action_key_in_dataset="action",
+            image_key_in_dataset="observation.images.image",
+            wrist_image_key_in_dataset="observation.images.image",
+            state_key_in_dataset="observation.state",
         ),
         weight_loader=weight_loaders.LaMDAWeightLoader("/data/models/biyuz/hf_home/models/LaMDA-full"),
         batch_size=4,
