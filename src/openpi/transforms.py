@@ -168,17 +168,23 @@ class Unnormalize(DataTransformFn):
         )
 
     def _unnormalize(self, x, stats: NormStats):
-        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
-        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
-        return x * (std + 1e-6) + mean
+        dim = x.shape[-1]
+        mean = np.asarray(stats.mean).flatten()
+        std = np.asarray(stats.std).flatten()
+        # Safety: slice to x dims so e.g. 8-dim state stats are not applied to 7-dim actions
+        current_mean = mean[:dim] if mean.shape[-1] >= dim else pad_to_dim(mean, dim, axis=-1, value=0.0)
+        current_std = std[:dim] if std.shape[-1] >= dim else pad_to_dim(std, dim, axis=-1, value=1.0)
+        return x * (current_std + 1e-6) + current_mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
-        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+        dim = x.shape[-1]
+        q01 = np.asarray(stats.q01).flatten()
+        q99 = np.asarray(stats.q99).flatten()
+        current_q01 = q01[:dim] if q01.shape[-1] >= dim else pad_to_dim(q01, dim, axis=-1, value=0.0)
+        current_q99 = q99[:dim] if q99.shape[-1] >= dim else pad_to_dim(q99, dim, axis=-1, value=0.0)
+        return (x + 1.0) / 2.0 * (current_q99 - current_q01 + 1e-6) + current_q01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -246,7 +252,7 @@ class AbsoluteActions(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
-    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.LaMDATokenizer
+    tokenizer: _tokenizer.PaligemmaTokenizer | _tokenizer.LaMDATokenizer | _tokenizer.LaViDaTokenizer
     discrete_state_input: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:

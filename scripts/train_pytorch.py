@@ -43,6 +43,7 @@ import wandb
 import openpi.models.lamda_config
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_lamda_pytorch
+import openpi.models_pytorch.pi0_lavida_pytorch
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
@@ -397,6 +398,10 @@ def train_loop(config: _config.TrainConfig):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
         model = openpi.models_pytorch.pi0_lamda_pytorch.PI0LamdaPytorch(model_cfg).to(device)
+    elif isinstance(config.model, openpi.models.lavida_config.LaViDaConfig):
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model = openpi.models_pytorch.pi0_lavida_pytorch.PI0LavidaPytorch(model_cfg).to(device)
     elif isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         model_cfg = config.model
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
@@ -435,12 +440,19 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
     if use_ddp:
+        # LaViDa (and models with internal activation checkpointing) need static_graph so DDP
+        # does not error "mark a variable ready only once" when the same parameter is used
+        # in multiple reentrant backward passes (e.g. deepspeed checkpointing).
+        use_static_graph = (
+            world_size >= 8
+            or isinstance(config.model, openpi.models.lavida_config.LaViDaConfig)
+        )
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+            find_unused_parameters=True,
+            gradient_as_bucket_view=True,
+            static_graph=use_static_graph,
         )
 
     # Load LaMDA pretrained weights (und-branch only, gen-branch filtered)
@@ -465,9 +477,14 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # Create optimizer: only parameters that require_grad (e.g. LaViDa freezes VLM, only action head is trained).
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if is_main and isinstance(config.model, openpi.models.lavida_config.LaViDaConfig):
+        n_total = sum(p.numel() for p in model.parameters())
+        n_trainable = sum(p.numel() for p in trainable_params)
+        logging.info(f"LaViDa: VLM frozen, only action head trained (trainable params: {n_trainable:,} / {n_total:,})")
     optim = torch.optim.AdamW(
-        model.parameters(),
+        trainable_params,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,

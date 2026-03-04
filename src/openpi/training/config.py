@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 
 import openpi.models.lamda_config as lamda_config
+import openpi.models.lavida_config as lavida_config
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
@@ -201,6 +202,25 @@ class LaMDAModelTransformFactory(GroupFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LaViDaModelTransformFactory(GroupFactory):
+    """Creates model transforms for LaViDa-based models (384×384 images, LaViDa tokenizer)."""
+
+    default_prompt: str | None = None
+
+    def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        return _transforms.Group(
+            inputs=[
+                _transforms.InjectDefaultPrompt(self.default_prompt),
+                _transforms.ResizeImages(384, 384),
+                _transforms.TokenizePrompt(
+                    _tokenizer.LaViDaTokenizer(model_config.max_token_len),
+                ),
+                _transforms.PadStatesAndActions(model_config.action_dim),
+            ],
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
@@ -385,6 +405,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # Model transforms include things like tokenizing the prompt and action targets
         if isinstance(model_config, lamda_config.LaMDAConfig):
             model_transforms = LaMDAModelTransformFactory()(model_config)
+        elif isinstance(model_config, lavida_config.LaViDaConfig):
+            model_transforms = LaViDaModelTransformFactory()(model_config)
         else:
             model_transforms = ModelTransformFactory()(model_config)
 
@@ -1030,6 +1052,36 @@ _CONFIGS = [
         pytorch_training_precision="bfloat16",
         overwrite=False,
         exp_name="lamda_libero_overfit",
+        wandb_enabled=True,
+    ),
+    # LaViDa + LIBERO: full training run (VLM frozen, action head only).
+    TrainConfig(
+        name="train_lavida_libero",
+        model=lavida_config.LaViDaConfig(),
+        data=LeRobotLiberoDataConfig(
+            repo_id="libero_lerobot",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+            action_key_in_dataset="action",
+            image_key_in_dataset="observation.images.image",
+            wrist_image_key_in_dataset="observation.images.image",
+            state_key_in_dataset="observation.state",
+        ),
+        weight_loader=weight_loaders.NoOpWeightLoader(),
+        batch_size=32,  # total; with 4 GPUs → 8 per device (effective_batch_size=8)
+        num_train_steps=50000,
+        save_interval=5000,
+        log_interval=10,
+        num_workers=2,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=50000,
+            decay_lr=1e-5,
+        ),
+        pytorch_training_precision="bfloat16",
+        overwrite=False,
+        exp_name="lavida_libero",
         wandb_enabled=True,
     ),
     TrainConfig(

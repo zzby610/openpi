@@ -102,6 +102,67 @@ class LaMDATokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+# LaViDa image placeholder token id (special id for <image>).
+LAVIDA_IMAGE_TOKEN_ID = -200
+
+LAVIDA_TOKENIZER_PATH = "/data/models/biyuz/hf_home/models/lavida-llada-v1.0-instruct"
+
+
+class LaViDaTokenizer:
+    """Tokenizer for the LaViDa (diffusion VLM) backbone.
+
+    Uses <image> as the image placeholder; its token id is -200. Loads the HF tokenizer
+    with trust_remote_code=True. __call__ returns {"input_ids": tensor} with -200 inserted
+    between text segments split by <image>.
+    """
+
+    def __init__(self, max_len: int = 48, tokenizer_path: str = LAVIDA_TOKENIZER_PATH):
+        self._max_len = max_len
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+    def __call__(self, prompt: str):
+        """Tokenize prompt: prepend <image>\\n if missing, split by <image>, insert -200 between segments. Returns {"input_ids": tensor}."""
+        if "<image>" not in prompt:
+            prompt = "<image>\n" + prompt
+        segments = prompt.split("<image>")
+        parts = []
+        for i, seg in enumerate(segments):
+            if seg:
+                ids = self._tokenizer.encode(seg, add_special_tokens=(i == 0))
+                parts.append(ids)
+            if i < len(segments) - 1:
+                parts.append([LAVIDA_IMAGE_TOKEN_ID])
+        if not parts:
+            parts = [[LAVIDA_IMAGE_TOKEN_ID]]
+        flat = []
+        for p in parts:
+            flat.extend(p)
+        if len(flat) > self._max_len:
+            flat = flat[: self._max_len]
+        elif len(flat) < self._max_len:
+            flat = flat + [self._tokenizer.pad_token_id or 0] * (self._max_len - len(flat))
+        import torch
+        return {"input_ids": torch.tensor([flat], dtype=torch.long)}
+
+    @property
+    def hf_tokenizer(self):
+        return self._tokenizer
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility with OpenPI tokenize(prompt, state) -> (tokens, mask)."""
+        out = self(prompt)
+        ids = out["input_ids"]
+        if hasattr(ids, "numpy"):
+            tokens = ids.numpy()
+        else:
+            tokens = np.array(ids)
+        if tokens.ndim == 2:
+            tokens = tokens[0]
+        pad_id = int(self._tokenizer.pad_token_id or 0)
+        mask = (tokens != pad_id).astype(bool)
+        return tokens, mask
+
+
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len
