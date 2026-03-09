@@ -156,6 +156,7 @@ class LaViDaConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
     lavida_model_path: str = "/data/models/biyuz/hf_home/models/lavida-llada-v1.0-instruct"
     action_dim: int = 7
+    state_dim: int = 8
     action_horizon: int = 50
     max_token_len: int = 48
 

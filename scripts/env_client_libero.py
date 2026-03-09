@@ -13,6 +13,7 @@ Dependencies: pyzmq, msgpack, numpy, libero, robosuite.
 
 from __future__ import annotations
 
+
 import os, logging
 _orig_fh = logging.FileHandler
 def _safe_filehandler(filename, *args, **kwargs):
@@ -26,11 +27,14 @@ import argparse
 import os
 import time
 from datetime import datetime
+import robosuite.utils.transform_utils as T
 
 import imageio
 import msgpack
 import numpy as np
 import zmq
+import robosuite.utils.transform_utils as T
+
 
 # ---------- msgpack ndarray protocol (must match server) ----------
 def _encode_ndarray(obj):
@@ -70,33 +74,32 @@ def ensure_uint8_hwc(img):
     return img
 
 
-def extract_obs(obs, image_size: int):
-    """Extract state, agentview, wrist from env obs (compatible with tuple/dict structures)."""
+def extract_obs(obs, image_size):
     actual = obs[0] if isinstance(obs, (tuple, list)) else obs
     if isinstance(actual, dict) and "observation" in actual:
         actual = actual["observation"]
-    if not isinstance(actual, dict):
-        actual = {}
-    # state: robot0_joint_pos or first key containing 'joint_pos', else zeros(8)
-    state = None
-    if "robot0_joint_pos" in actual:
-        state = np.asarray(actual["robot0_joint_pos"], dtype=np.float32)
+
+    # --- 核心修复：提取末端笛卡尔坐标，而不是关节角 ---
+    if "robot0_eef_pos" in actual:
+        # 1. 提取 3D 位置 (X, Y, Z)
+        eef_pos = actual["robot0_eef_pos"]
+        
+        # 提取旋转并转换为轴角 (Axis-Angle)
+        eef_quat = actual["robot0_eef_quat"]
+        eef_axis_angle = T.quat2axisangle(eef_quat) # <--- 就是这句救命的代码
+        
+        # 提取 2D 夹爪状态
+        gripper = actual.get("robot0_gripper_qpos", np.zeros(2))
+        
+        # 拼接成 8 维
+        state = np.concatenate([eef_pos, eef_axis_angle, gripper]).astype(np.float32)
     else:
-        for k, v in actual.items():
-            if "joint_pos" in k:
-                state = np.asarray(v, dtype=np.float32)
-                break
-    if state is None:
         state = np.zeros(8, dtype=np.float32)
-    state = np.asarray(state).reshape(-1)
-    # images
-    agentview = actual.get("agentview_image", np.zeros((image_size, image_size, 3)))
-    wrist = actual.get("robot0_eye_in_hand_image", np.zeros((image_size, image_size, 3)))
-    agentview = ensure_uint8_hwc(agentview)
-    wrist = ensure_uint8_hwc(wrist)
+
+    agentview = actual.get("agentview_image", np.zeros((image_size, image_size, 3), dtype=np.uint8))
+    wrist = actual.get("robot0_eye_in_hand_image", np.zeros((image_size, image_size, 3), dtype=np.uint8))
+
     return state, agentview, wrist
-
-
 def bddl_to_prompt(bddl_path: str) -> str:
     """Turn bddl filename into a short prompt (e.g. task_0.bddl -> 'task 0')."""
     name = os.path.basename(bddl_path).replace(".bddl", "").replace("_", " ")
@@ -121,6 +124,7 @@ def main():
         raise FileNotFoundError(f"BDDL not found: {bddl_path}")
 
     from libero.libero.envs import OffScreenRenderEnv
+    from libero.libero import benchmark
 
     env = OffScreenRenderEnv(
         bddl_file_name=bddl_path,
@@ -139,31 +143,94 @@ def main():
 
     successes = 0
     bddl_stem = os.path.basename(bddl_path).replace(".bddl", "")
+    chunk_use = 4  # use first N steps of each chunk for open-loop execution
+
+    # Load official fixed init_states for this task (align with Libero benchmark / training data).
+    task_suite = benchmark.get_benchmark_dict()["libero_spatial"]()
+    task_name = bddl_stem
+    all_task_names = task_suite.get_task_names()
+    try:
+        task_id = all_task_names.index(task_name)
+    except ValueError:
+        task_id = None
+    init_states = None
+    if task_id is not None:
+        init_states = task_suite.get_task_init_states(task_id)
+        if hasattr(init_states, "numpy"):
+            init_states = init_states.numpy()
+    if init_states is not None and len(init_states) == 0:
+        init_states = None
+
     for ep in range(args.episodes):
         obs = env.reset()
+        if init_states is not None and len(init_states) > 0:
+            init_state = init_states[ep % len(init_states)]
+            if hasattr(init_state, "numpy"):
+                init_state = init_state.numpy()
+            obs = env.set_init_state(init_state)
+        for _ in range(10):
+            dummy_action = np.zeros(7)
+            obs, _, _, _ = env.step(dummy_action)
         frames = []
+        action_buffer = []
         consecutive_success = 0
         step_succeeded = None
         for step in range(args.steps):
             state, agentview, wrist = extract_obs(obs, args.image_size)
+
+            if step < 5:
+                print("STATE:", state)
+                print("STATE MAX:", np.abs(state).max())
             img = np.asarray(agentview)
             frame = (img * 255).clip(0, 255).astype(np.uint8) if np.issubdtype(img.dtype, np.floating) else img.astype(np.uint8).copy()
             frames.append(frame)
-            req = {
-                "state": state,
-                "agentview": agentview,
-                "wrist": wrist,
-                "prompt": prompt,
-            }
-            socket.send(pack_request(req))
-            raw = socket.recv()
-            resp = unpack_response(raw)
-            if not resp.get("ok", False):
-                print(resp.get("traceback", resp.get("error", "unknown error")))
-                raise RuntimeError(resp.get("error", "policy server error"))
-            action = np.asarray(resp["action"], dtype=np.float64).reshape(-1)[:7]
+
+            # Request new action chunk only when buffer is empty (action chunking / open-loop).
+            if len(action_buffer) == 0:
+                req = {
+                    "state": state,
+                    "agentview": agentview,
+                    "wrist": wrist,
+                    "prompt": prompt,
+                }
+                socket.send(pack_request(req))
+                raw = socket.recv()
+                resp = unpack_response(raw)
+                if not resp.get("ok", False):
+                    print(resp.get("traceback", resp.get("error", "unknown error")))
+                    raise RuntimeError(resp.get("error", "policy server error"))
+                chunk = np.asarray(resp["action"], dtype=np.float64)
+                print("CHUNK SHAPE:", chunk.shape)
+                print("CHUNK SAMPLE:", chunk[0])
+                if chunk.ndim == 1:
+                    chunk = chunk.reshape(1, -1)
+                n_use = min(chunk_use, len(chunk))
+                for i in range(n_use):
+                    row = chunk[i].reshape(-1)[:7]
+                    if len(row) < 7:
+                        row = np.resize(row, 7)
+                    action_buffer.append(row.astype(np.float64))
+
+            if len(action_buffer) == 0:
+                action = np.zeros(7, dtype=np.float64)
+            else:
+                action = np.asarray(action_buffer.pop(0), dtype=np.float64).reshape(-1)[:7]
+
+            if step < 5:
+                print("ACTION:", action)
+                print("ACTION MAX:", np.abs(action).max())
             if len(action) < 7:
                 action = np.resize(action, 7)
+            # Gripper binarization: index 6 -> 1.0 (grip) or -1.0 (release) for reliable rigid contact
+            action[6] = 1.0 if action[6] > 0.8 else -1.0
+
+            # LIBERO expects actions in [-1, 1]. Unbounded model output can yield 4.0+ after unnormalize → 乱飞.
+            # Clip to safe range before env.step (only first 6 dims; dim 6 is already ±1).
+            action_before_clip = action.copy()
+            action[:6] = np.clip(action[:6], -1.0, 1.0)
+            if step < 10 and np.any(np.abs(action_before_clip[:6]) > 1.0):
+                print(f"[clip] step {step}: pre-clip max |action[:6]| = {np.abs(action_before_clip[:6]).max():.3f} -> post-clip max = {np.abs(action[:6]).max():.3f}")
+
             result = env.step(action)
             obs = result[0]
             reward = result[1] if len(result) > 1 else 0.0

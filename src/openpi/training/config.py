@@ -564,7 +564,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "/data/models/biyuz/hf_models"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -572,7 +572,7 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
-    num_workers: int = 2
+    num_workers: int = 1
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -1055,6 +1055,7 @@ _CONFIGS = [
         wandb_enabled=True,
     ),
     # LaViDa + LIBERO: full training run (VLM frozen, action head only).
+    # Resume: use --resume and checkpoint_base_dir so checkpoint_dir points to existing run (e.g. .../lavida_libero/15000).
     TrainConfig(
         name="train_lavida_libero",
         model=lavida_config.LaViDaConfig(),
@@ -1068,15 +1069,16 @@ _CONFIGS = [
             state_key_in_dataset="observation.state",
         ),
         weight_loader=weight_loaders.NoOpWeightLoader(),
-        batch_size=32,  # total; with 4 GPUs → 8 per device (effective_batch_size=8)
-        num_train_steps=50000,
+        batch_size=64,  # total; with 4 GPUs → 16 per device (effective_batch_size=16)
+        num_train_steps=100000,  # resume from 50k -> train to 100k
         save_interval=5000,
         log_interval=10,
         num_workers=2,
+        checkpoint_base_dir="/data/models/biyuz/hf_models",  # checkpoint_dir = .../train_lavida_libero/lavida_libero; use --resume to load 50000
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
             peak_lr=5e-5,
-            decay_steps=50000,
+            decay_steps=100000,  # full 100k decay so 50k->100k still in decay
             decay_lr=1e-5,
         ),
         pytorch_training_precision="bfloat16",

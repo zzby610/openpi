@@ -100,4 +100,5 @@ def build_policy(checkpoint_dir: str, norm_stats_path: str, device: str) -> _pol
         ],
         is_pytorch=True,
         pytorch_device=device,
+        sample_kwargs={"num_steps": 150},
     )

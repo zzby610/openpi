@@ -273,36 +273,88 @@
 
 
 
+"""LaViDa VLM backbone for OpenPI.
+
+Code path: model class is imported from the LaViDa source repo (PYTHONPATH).
+Weight path: only config.json and safetensors are read from the weight directory;
+no .py files are executed from there (avoids broken scripts in the cache dir).
+"""
+
 import logging
-import os
-import sys
+from pathlib import Path
+
 import torch
 from torch import nn
+from safetensors.torch import load_file
 
 logger = logging.getLogger(__name__)
 
-def _load_lavida_model(model_path: str, torch_dtype: torch.dtype):
-    # 只要模型文件都在根目录，且导入语句已改，直接加路径即可
-    if model_path not in sys.path:
-        sys.path.insert(0, model_path)
+# Default weight path (read-only: config + safetensors).
+DEFAULT_WEIGHT_PATH = "/data/models/biyuz/hf_home/models/lavida-llada-v1.0-instruct"
 
+
+def _import_lavida_model_class():
+    """Import LlavaLladaForMaskedDiffusion and LlavaLladaConfig from the LaViDa source repo.
+    Requires PYTHONPATH to include the LaViDa repo root (e.g. export PYTHONPATH=.../LaViDa:$PYTHONPATH).
+    """
     try:
-        # 因为咱们删了所有的“点”，这里能直接 import 成功
-        import llava_llada
-        cls = getattr(llava_llada, "LlavaLladaForMaskedDiffusion", None)
-    except Exception as e:
-        logger.error("[lavida_pytorch] 导入失败。请确保已运行 sed 清理命令。错误: %s", e)
+        from llava.model.language_model.llava_llada import (
+            LlavaLladaForMaskedDiffusion,
+            LlavaLladaConfig,
+        )
+        return LlavaLladaForMaskedDiffusion, LlavaLladaConfig
+    except ImportError as e:
+        logger.error(
+            "[lavida_pytorch] Failed to import from LaViDa repo. "
+            "Set PYTHONPATH to include the LaViDa source root: "
+            "export PYTHONPATH=/export/ra/zoubiyu/repo/LaViDa:$PYTHONPATH. Error: %s",
+            e,
+        )
         raise
 
-    # 加载模型
-    model = cls.from_pretrained(
-        model_path,
-        torch_dtype=torch_dtype,
-        trust_remote_code=True,
-        local_files_only=True,
+
+def _load_lavida_model(weight_path: str, torch_dtype: torch.dtype):
+    """Load LaViDa model using code from the LaViDa repo and weights from weight_path only.
+
+    - Code path: LlavaLladaForMaskedDiffusion is imported from llava.model... (LaViDa repo).
+    - Weight path: we only read config.json and *.safetensors from weight_path; no Python
+      files are executed from that directory (so broken .py in the cache dir are never run).
+    - We do NOT use trust_remote_code=True with the weight path to avoid loading any script from it.
+    """
+    weight_path = weight_path or DEFAULT_WEIGHT_PATH
+    weight_dir = Path(weight_path)
+    if not weight_dir.is_dir():
+        raise FileNotFoundError(f"[lavida_pytorch] Weight directory not found: {weight_path}")
+
+    ModelClass, ConfigClass = _import_lavida_model_class()
+
+    # Load config from weight dir (reads config.json only; no .py executed).
+    config = ConfigClass.from_pretrained(str(weight_dir))
+    # Build model structure from the class we imported (LaViDa repo code).
+    model = ModelClass(config)
+    model = model.to(torch_dtype)
+
+    # Load state dict from safetensors only (no code from weight dir).
+    safetensors_files = sorted(weight_dir.glob("*.safetensors"))
+    if not safetensors_files:
+        raise FileNotFoundError(
+            f"[lavida_pytorch] No .safetensors files in {weight_path}. "
+            "We only load weights from safetensors, not from the directory's Python scripts."
+        )
+    state_dict = {}
+    for f in safetensors_files:
+        state_dict.update(load_file(str(f)))
+    load_result = model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys:
+        logger.warning("[lavida_pytorch] load_state_dict missing_keys: %s", load_result.missing_keys[:20])
+    if load_result.unexpected_keys:
+        logger.warning("[lavida_pytorch] load_state_dict unexpected_keys: %s", load_result.unexpected_keys[:20])
+
+    logger.info(
+        "[lavida_pytorch] Loaded LaViDa from repo code + weights from %s (%d safetensors)",
+        weight_path,
+        len(safetensors_files),
     )
-    
-    logger.info("[lavida_pytorch] 视觉模型加载成功！")
     return model
 
 class LavidaPytorch(nn.Module):

@@ -136,19 +136,20 @@ def main():
             t0 = time.perf_counter()
             out = policy.infer(obs_dict)
             latency_ms = (time.perf_counter() - t0) * 1000
-            actions_arr = np.asarray(out["actions"]).reshape(-1)[:7]
-            actions_str = ", ".join(f"{x:.4f}" for x in actions_arr.tolist())
-            print(f"[Server] Step {step_idx}: Predicted Actions = [{actions_str}]  latency_ms = {latency_ms:.2f}")
-            step_idx += 1
-            # policy output_transforms (Unnormalize + LiberoOutputs) use norm_stats by key: actions -> norm_stats["actions"] (7d), state -> norm_stats["state"] (8d)
+            # Return full action chunk for open-loop execution (no single-step slicing).
             action = np.asarray(out["actions"], dtype=np.float32)
-            if action.ndim >= 2:
-                action = action[0]
-            if action.ndim == 2:
-                action = action[0]
-            action = action.reshape(-1)[:7]
-            if len(action) < 7:
-                action = np.resize(action, 7)
+            if action.ndim == 1:
+                action = action.reshape(1, 7) if action.size >= 7 else np.resize(action, 7).reshape(1, 7)
+            elif action.ndim == 3:
+                # (1, chunk_size, 7) -> (chunk_size, 7)
+                action = action.reshape(action.shape[1], action.shape[2])
+            elif action.ndim == 2 and action.shape[1] != 7:
+                action = action.reshape(-1, 7)
+            if action.shape[-1] != 7:
+                action = action[..., :7] if action.shape[-1] > 7 else np.pad(action, ((0, 0), (0, 7 - action.shape[-1])))
+            first_step_str = ", ".join(f"{x:.4f}" for x in action[0].tolist())
+            print(f"[Server] Step {step_idx}: Chunk shape {action.shape}, first = [{first_step_str}]  latency_ms = {latency_ms:.2f}")
+            step_idx += 1
             resp = {"ok": True, "action": action.astype(np.float32)}
         except Exception as e:
             resp = {
